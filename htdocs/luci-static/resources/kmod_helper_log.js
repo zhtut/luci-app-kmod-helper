@@ -91,7 +91,14 @@ function clear() {
 	push('info', 'log', 'frontend session log cleared');
 }
 
-return {
+/*
+ * LuCI's module loader requires the factory to yield a constructor
+ * (a plain object triggers "factory yields invalid constructor"), so export
+ * a function and install the API both as static members and as prototype
+ * members: views may use the injected value either way.
+ */
+var logger = function() {};
+var api = {
 	push: push,
 	rpc: rpc,
 	ui: ui,
@@ -100,3 +107,9 @@ return {
 	getEntries: getEntries,
 	clear: clear
 };
+for (var k in api) {
+	logger[k] = api[k];
+	logger.prototype[k] = api[k];
+}
+
+return logger;
