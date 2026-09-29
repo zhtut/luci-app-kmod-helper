@@ -317,9 +317,9 @@ m_search_kmods() {
 		}
 		if (pkg == "") next
 		if (kw != "" && tolower(pkg) !~ tolower(kw) && tolower(desc) !~ tolower(kw)) next
-		gsub(/\\/, "\\\\", desc); gsub(/"/, "\\\"", desc)
-		gsub(/\\/, "\\\\", deps); gsub(/"/, "\\\"", deps)
-		gsub(/\\/, "\\\\", fname); gsub(/"/, "\\\"", fname)
+		gsub(/\\/, "\\\\&", desc); gsub(/"/, "\\\\&", desc)
+		gsub(/\\/, "\\\\&", deps); gsub(/"/, "\\\\&", deps)
+		gsub(/\\/, "\\\\&", fname); gsub(/"/, "\\\\&", fname)
 		gsub(/\r/, "", pkg); gsub(/\r/, "", ver)
 		if (!first) printf ","
 		printf "{\"name\":\"%s\",\"version\":\"%s\",\"description\":\"%s\",\"size\":\"%s\",\"filename\":\"%s\",\"depends\":\"%s\"}", pkg, ver, desc, size, fname, deps
@@ -341,14 +341,14 @@ m_get_installed_kmods() {
 				ver=$0
 				sub(/^[^ ]+ +- +/, "", ver)
 				sub(/ +-.*$/, "", ver)
-				gsub(/"/, "\\\"", ver)
+				gsub(/\\/, "\\\\&", ver); gsub(/"/, "\\\\&", ver)
 				if (!first) printf ","
 				printf "{\"name\":\"%s\",\"version\":\"%s\"}", name, ver
 				first=0
 			}
 			END { print "]}" }'
 	elif [ "$pmgr" = "apk" ]; then
-		apk info 2>/dev/null | awk '
+		apk info -v 2>/dev/null | awk '
 			BEGIN { printf "{\"success\":true,\"manager\":\"apk\",\"packages\":["; first=1 }
 			/^kmod-/ {
 				pv=$1
