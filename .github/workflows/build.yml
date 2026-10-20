@@ -1,0 +1,93 @@
+name: Build LuCI apps
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.fmt }} (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: openwrt-24.10
+            fmt: ipk
+          - branch: openwrt-25.10
+            fmt: apk
+
+    steps:
+      - name: Checkout plugins
+        uses: actions/checkout@v4
+
+      - name: Clone ImmortalWRT (${{ matrix.branch }})
+        run: git clone --depth=1 --branch "${{ matrix.branch }}" https://github.com/immortalwrt/immortalwrt.git
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: dl-${{ matrix.branch }}
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            immortalwrt/staging_dir
+            immortalwrt/build_dir
+            immortalwrt/tmp
+            immortalwrt/.config
+          key: toolchain-${{ matrix.branch }}-${{ hashFiles('immortalwrt/include/**', 'immortalwrt/toolchain/**') }}
+          restore-keys: toolchain-${{ matrix.branch }}-
+
+      - name: Copy plugins into buildroot
+        run: |
+          for d in luci-app-*; do
+            cp -r "$d" "immortalwrt/package/$d"
+          done
+
+      - name: Update and install feeds
+        run: |
+          cd immortalwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          cd immortalwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_PACKAGE_luci-app-easy-setup=m
+          CONFIG_PACKAGE_luci-app-kmod-helper=m
+          EOF
+          make defconfig
+
+      - name: Build packages
+        run: |
+          cd immortalwrt
+          PKGS="package/luci-app-easy-setup/compile package/luci-app-kmod-helper/compile"
+          make -j"$(nproc)" $PKGS V=s || make $PKGS V=s
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find immortalwrt/bin/packages -type f \
+            \( -name 'luci-app-*.ipk' -o -name 'luci-app-*.apk' \) \
+            -exec cp -v {} out/ \;
+          ls -la out/
+          test -n "$(ls -A out)" || { echo "::error::No packages were built"; exit 1; }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-apps-${{ matrix.fmt }}-${{ github.ref_name }}
+          path: out/

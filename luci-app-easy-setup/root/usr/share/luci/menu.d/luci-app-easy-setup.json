@@ -1,0 +1,13 @@
+{
+	"admin/system/easy-setup": {
+		"title": "Easy Setup",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "easy-setup/index"
+		},
+		"depends": {
+			"acl": [ "luci-app-easy-setup" ]
+		}
+	}
+}

@@ -1,0 +1,18 @@
+{
+	"luci-app-easy-setup": {
+		"description": "Grant access to easy setup procedures",
+		"read": {
+			"ubus": {
+				"luci.easy-setup": [ "get_current" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.easy-setup": [
+					"set_hostname", "set_password", "set_lan_ip",
+					"set_wifi", "set_mode"
+				]
+			}
+		}
+	}
+}

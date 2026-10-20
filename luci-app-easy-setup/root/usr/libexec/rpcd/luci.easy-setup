@@ -1,0 +1,303 @@
+#!/bin/sh
+# rpcd backend for luci-app-easy-setup
+# Protocol:
+#   list -> output method signature JSON
+#   call <method> -> read JSON args from stdin, output result JSON
+#
+# NOTE: this file MUST keep LF line endings (enforced by .gitattributes).
+# CRLF would break every command name and rpcd replies with empty objects.
+#
+# User-facing error strings here are Chinese on purpose: the primary audience
+# is Chinese beginners and shell strings do not go through LuCI po translation.
+# The frontend validates first with translated messages; this is the second
+# line of defense at the trust boundary.
+
+. /usr/share/libubox/jshn.sh
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# ---------- reply helpers ----------
+
+reply_err() {
+	json_init
+	json_add_boolean success 0
+	json_add_string error "$1"
+	json_dump
+}
+
+reply_ok() {
+	json_init
+	json_add_boolean success 1
+	[ -n "$1" ] && json_add_string detail "$1"
+	json_dump
+}
+
+# ---------- validators ----------
+# Each err_* echoes an error message on failure, nothing on success.
+
+err_ipv4() {
+	# strict dotted-quad IPv4: 4 octets 0-255, no leading zeros, no empty parts
+	_ip="$1"
+	_bad="「${_ip}」不是有效的 IP 地址，正确格式如 192.168.1.2"
+	case "$_ip" in
+		""|*[!0-9.]*) echo "$_bad"; return ;;
+	esac
+	_savedIFS="$IFS"; IFS='.'
+	set -- $_ip
+	IFS="$_savedIFS"
+	[ $# -eq 4 ] || { echo "$_bad"; return; }
+	for _o in "$1" "$2" "$3" "$4"; do
+		case "$_o" in
+			""|*[!0-9]*) echo "$_bad"; return ;;
+		esac
+		case "$_o" in
+			0?) [ "$_o" != "0" ] && { echo "「${_ip}」含有前导零（${_o}），请去掉多余的 0"; return; } ;;
+			00*) echo "「${_ip}」含有前导零（${_o}），请去掉多余的 0"; return ;;
+		esac
+		[ "$_o" -gt 255 ] && { echo "「${_ip}」中的 ${_o} 超出了 0-255 范围"; return; }
+	done
+}
+
+err_private_ip() {
+	# IPv4 + RFC1918 + usable host address (last octet not 0/255, /24 assumed)
+	_e=$(err_ipv4 "$1")
+	[ -n "$_e" ] && { echo "$_e"; return; }
+	_savedIFS="$IFS"; IFS='.'
+	set -- $1
+	IFS="$_savedIFS"
+	_a=$1; _b=$2; _d=$4
+	if [ "$_d" -eq 0 ] || [ "$_d" -eq 255 ]; then
+		echo "「${1}」是网段地址或广播地址，设备不能使用，末位请填 1-254 之间的数字"
+		return
+	fi
+	[ "$_a" -eq 10 ] && return
+	[ "$_a" -eq 192 ] && [ "$_b" -eq 168 ] && return
+	[ "$_a" -eq 172 ] && [ "$_b" -ge 16 ] && [ "$_b" -le 31 ] && return
+	echo "「${1}」不是局域网地址。请填写 192.168.x.x（如 192.168.1.2）或 10.x.x.x（如 10.0.0.2）开头的内网 IP"
+}
+
+err_hostname() {
+	_n="$1"
+	if [ -z "$_n" ] || [ ${#_n} -gt 32 ]; then
+		echo "主机名长度需为 1-32 个字符"
+		return
+	fi
+	printf '%s' "$_n" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$' || \
+		echo "主机名只能包含字母、数字和连字符（-），且不能以连字符开头或结尾，例如 OpenWrt-Lab"
+}
+
+err_password() {
+	[ ${#1} -ge 8 ] || echo "密码太短：为了安全，至少需要 8 位字符"
+}
+
+err_ssid() {
+	_s="$1"
+	[ -n "$_s" ] || { echo "WiFi 名称不能为空"; return; }
+	[ ${#_s} -le 32 ] || echo "WiFi 名称最长 32 个字符，请缩短一些"
+}
+
+err_wifi_key() {
+	_l=${#1}
+	if [ "$_l" -lt 8 ] || [ "$_l" -gt 63 ]; then
+		echo "WiFi 密码长度需为 8-63 位"
+	fi
+}
+
+# ---------- helpers ----------
+
+list_wifi_ifaces() {
+	uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\(.*\)=wifi-iface$/\1/p'
+}
+
+# Restart a service after a short delay so this RPC reply still reaches the
+# browser before the connection drops; the frontend shows the reconnect banner.
+restart_later() {
+	(sleep 1; "$@") >/dev/null 2>&1 &
+}
+
+# ---------- methods ----------
+
+m_get_current() {
+	json_init
+	json_add_boolean success 1
+	json_add_string hostname "$(uci -q get system.@system[0].hostname)"
+	json_add_string lan_ip "$(uci -q get network.lan.ipaddr)"
+	json_add_string lan_netmask "$(uci -q get network.lan.netmask)"
+	_gw=$(uci -q get network.lan.gateway)
+	[ -n "$_gw" ] || _gw=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -n1)
+	json_add_string gateway "${_gw:-}"
+	json_add_array wifi
+	for _iface in $(list_wifi_ifaces); do
+		json_add_object ""
+		json_add_string section "$_iface"
+		json_add_string ssid "$(uci -q get wireless.$_iface.ssid)"
+		json_add_string encryption "$(uci -q get wireless.$_iface.encryption)"
+		[ "$(uci -q get wireless.$_iface.disabled)" = 1 ] && _dis=1 || _dis=0
+		json_add_boolean disabled "$_dis"
+		json_close_object
+	done
+	json_close_array
+	json_dump
+}
+
+m_set_hostname() {
+	json_get_var _name name
+	_e=$(err_hostname "$_name")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	uci -q set system.@system[0].hostname="$_name" || { reply_err "写入配置失败（uci set）"; return; }
+	uci commit system || { reply_err "保存配置失败（uci commit）"; return; }
+	/etc/init.d/system reload >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	reply_ok "主机名已改为「${_name}」，立即生效"
+}
+
+m_set_password() {
+	json_get_var _pw password
+	_e=$(err_password "$_pw")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	# shortcut: busybox passwd reads the two prompts from stdin; works on all
+	# OpenWrt/ImmortalWRT targets. Upgrade only if a target ships shadow-utils.
+	if printf '%s\n%s\n' "$_pw" "$_pw" | passwd root >/dev/null 2>&1; then
+		reply_ok "管理密码已更新，下次登录请使用新密码"
+	else
+		reply_err "密码修改失败，请重试"
+	fi
+}
+
+m_set_lan_ip() {
+	json_get_var _ip ip
+	_e=$(err_private_ip "$_ip")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	_old=$(uci -q get network.lan.ipaddr)
+	uci -q set network.lan.ipaddr="$_ip" || { reply_err "写入配置失败"; return; }
+	uci commit network || { uci -q revert network; reply_err "保存配置失败"; return; }
+	restart_later /etc/init.d/network restart
+	reply_ok "LAN IP 已从 ${_old:-未设置} 改为 ${_ip}，设备网络正在重启"
+}
+
+m_set_wifi() {
+	json_get_var _ssid ssid
+	json_get_var _key key
+	_e=$(err_ssid "$_ssid")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	if [ -n "$_key" ]; then
+		_e=$(err_wifi_key "$_key")
+		[ -n "$_e" ] && { reply_err "$_e"; return; }
+	fi
+	_n=0
+	for _iface in $(list_wifi_ifaces); do
+		uci -q set wireless.$_iface.ssid="$_ssid"
+		if [ -n "$_key" ]; then
+			uci -q set wireless.$_iface.key="$_key"
+			# an open/WEP network silently ignores a PSK: bump it to WPA2
+			case "$(uci -q get wireless.$_iface.encryption)" in
+				""|none|wep*) uci -q set wireless.$_iface.encryption=psk2 ;;
+			esac
+		fi
+		uci -q set wireless.$_iface.disabled=0
+		_n=$((_n+1))
+	done
+	[ "$_n" -gt 0 ] || { reply_err "没有找到无线接口，这台设备可能不支持 WiFi"; return; }
+	uci commit wireless || { reply_err "保存配置失败"; return; }
+	(sleep 1; wifi reload >/dev/null 2>&1 || ubus call network.wireless reload >/dev/null 2>&1) &
+	reply_ok "WiFi 名称已改为「${_ssid}」，无线正在重启，当前 WiFi 连接会断开"
+}
+
+m_set_mode() {
+	json_get_var _mode mode
+	json_get_var _lanip lan_ip
+	json_get_var _gw gw_ip
+	case "$_mode" in
+		bypass) _label="旁路由" ;;
+		ap) _label="无线接入点（AP）" ;;
+		*) reply_err "未知模式：${_mode}"; return ;;
+	esac
+	_e=$(err_private_ip "$_lanip")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	_e=$(err_private_ip "$_gw")
+	[ -n "$_e" ] && { reply_err "$_e"; return; }
+	if [ "$_lanip" = "$_gw" ]; then
+		reply_err "本机 IP 不能和主路由 IP 相同，请把本机 IP 的末位改成其他数字"
+		return
+	fi
+	# /24 assumed: first three octets must match or the gateway is unreachable
+	if [ "${_lanip%.*}" != "${_gw%.*}" ]; then
+		reply_err "本机 IP（${_lanip}）和主路由 IP（${_gw}）必须在同一网段：前三段数字要相同，例如 192.168.1.2 配 192.168.1.1"
+		return
+	fi
+	uci -q set network.lan.ipaddr="$_lanip" || { reply_err "写入配置失败"; return; }
+	uci -q set network.lan.gateway="$_gw"
+	uci -q delete network.lan.dns 2>/dev/null
+	uci -q add_list network.lan.dns="$_gw"
+	# LAN DHCP off: the main router hands out addresses from now on
+	for _s in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.]*\)=dhcp$/\1/p'); do
+		[ "$(uci -q get dhcp.$_s.interface)" = lan ] && uci -q set dhcp.$_s.ignore=1
+	done
+	uci commit dhcp >/dev/null 2>&1
+	# open the firewall for LAN: behind another router this box must not filter
+	if uci -q show firewall >/dev/null 2>&1; then
+		for _z in $(uci -q show firewall | sed -n 's/^firewall\.\([^.]*\)=zone$/\1/p'); do
+			if [ "$(uci -q get firewall.$_z.name)" = lan ]; then
+				uci -q set firewall.$_z.input=ACCEPT
+				uci -q set firewall.$_z.forward=ACCEPT
+			fi
+		done
+		uci commit firewall >/dev/null 2>&1
+	fi
+	uci commit network || { uci -q revert network; reply_err "保存配置失败"; return; }
+	(sleep 1; /etc/init.d/dnsmasq restart; /etc/init.d/firewall restart; /etc/init.d/network restart) >/dev/null 2>&1 &
+	reply_ok "已切换为${_label}模式：本机 IP ${_lanip}，主路由 ${_gw}，设备网络正在重启"
+}
+
+# ---------- rpcd dispatch ----------
+
+case "$1" in
+list)
+	json_init
+	json_add_object get_current
+	json_close_object
+	json_add_object set_hostname
+	json_add_string name ""
+	json_close_object
+	json_add_object set_password
+	json_add_string password ""
+	json_close_object
+	json_add_object set_lan_ip
+	json_add_string ip ""
+	json_close_object
+	json_add_object set_wifi
+	json_add_string ssid ""
+	json_add_string key ""
+	json_close_object
+	json_add_object set_mode
+	json_add_string mode ""
+	json_add_string lan_ip ""
+	json_add_string gw_ip ""
+	json_close_object
+	json_dump
+	;;
+call)
+	json_init
+	json_load "$(cat)"
+	case "$2" in
+	get_current) m_get_current ;;
+	set_hostname) m_set_hostname ;;
+	set_password) m_set_password ;;
+	set_lan_ip) m_set_lan_ip ;;
+	set_wifi) m_set_wifi ;;
+	set_mode) m_set_mode ;;
+	*)
+		json_init
+		json_add_boolean success 0
+		json_add_string error "Unknown method: $2"
+		json_dump
+		;;
+	esac
+	;;
+*)
+	echo '{"error":"Invalid request. Use list or call."}'
+	exit 1
+	;;
+esac
+
+exit 0
